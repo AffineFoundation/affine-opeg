@@ -1,4 +1,4 @@
-# affine-offpolicy-evaluation-generation
+# affine-opeg
 
 Off-policy rollout **generator** + **publisher** for Affine's
 [`distill-v2`](https://github.com/AffineFoundation/affinetes/tree/main/environments/distill-v2)
