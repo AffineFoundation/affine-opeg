@@ -1,0 +1,59 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "affine-offpolicy-evaluation-generation"
+version = "0.1.0"
+description = "Off-policy rollout generator + publisher for Affine's distill-v2 evaluation pipeline"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Affine Foundation" }]
+
+dependencies = [
+    # DB
+    "sqlalchemy[asyncio]>=2.0.30",
+    "asyncpg",
+    "alembic",
+    # Blob (R2 / S3)
+    "aioboto3",
+    "boto3",
+    # Domain
+    "pydantic>=2.6",
+    "pydantic-settings",
+    # Runtime
+    "anyio",
+    "click>=8",
+    "click-log",
+    "structlog",
+    "tenacity",
+    "zstandard",
+    "orjson",
+    "pyyaml",
+    "httpx>=0.27",
+    "pyarrow",
+    # Sandbox / docker
+    "docker",
+    # Tokenizers used by normalizers / smoke seed
+    "transformers",
+    "sentencepiece",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio",
+    "ruff",
+    "mypy",
+]
+
+[project.scripts]
+affine-opeg-generator = "affine_opeg.main:main"
+affine-opeg-publisher = "affine_opeg.publishing.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+affine_opeg = ["**/*.sql", "**/*.json"]
