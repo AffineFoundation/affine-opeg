@@ -95,9 +95,10 @@ async def promote_mature(params: PromoteParams) -> PromoteResult:
         blob, prefix, public_bucket,
     )
 
-    # 2) Find rows that are published, mature, and not yet promoted.
+    # 2) Find manifest entries that aren't in the public manifest yet.
     candidates = await _list_ready_to_promote(
         sm, params.max_per_cycle, params.max_per_day,
+        already_promoted=public_known,
     )
     log.info("promoter.candidates", n=len(candidates))
 
@@ -270,17 +271,23 @@ class _Candidate:
 
 async def _list_ready_to_promote(
     sm, max_per_cycle: int, max_per_day: int,
+    *,
+    already_promoted: set,
 ) -> list[_Candidate]:
-    """Pending-promote cells: present in the private manifest + not yet promoted.
+    """Pending-promote cells: present in the private manifest + not yet
+    in the public manifest.
 
-    The source of truth for "promotable" is the private manifest, not
-    ``sampling_progress.published_at``. Generator-side hooks (e.g.
-    ``freeze_degenerate_cell``) set ``published_at`` directly to skip
-    publisher processing for zero-variance cells — those cells never
-    enter the manifest but would otherwise pollute the candidate query
-    and saturate any LIMIT the promoter applied. Reading the manifest
-    first and joining DB only for the promoted set sidesteps that whole
-    class of bug.
+    The source of truth for "promotable" is the private manifest;
+    "already-promoted" is the public manifest. Both come from R2, so
+    the DB ``sampling_progress`` table can diverge (generator-side
+    hooks like ``freeze_degenerate_cell`` set ``published_at`` without
+    a manifest entry, and historical row deletions can leave manifest
+    keys with no DB peer) without breaking the promoter — we just use
+    R2 as the authority for both sides of the decision.
+
+    The DB is still read for the rate-cap window (``promoted_at`` in
+    the last 24h), because it has per-cell timestamps the manifest
+    doesn't carry historically.
     """
     cfg = load_config()
     blob = S3BlobStore(cfg.blob)
@@ -323,24 +330,9 @@ async def _list_ready_to_promote(
                  promoted_last_24h=today_count)
         return []
 
-    # Read the already-promoted key set from PG so we skip what's done.
-    # One bounded query — the set grows linearly with completed cells,
-    # well under hundreds of thousands at expected throughput.
-    async with sm() as session:
-        promoted_rows = (await session.execute(
-            select(
-                sp_t.c.list_name, sp_t.c.env_name, sp_t.c.task_id,
-                sp_t.c.teacher_name,
-            ).where(sp_t.c.promoted_at.is_not(None))
-        )).all()
-    promoted_keys = {
-        (r.list_name, r.env_name, int(r.task_id), r.teacher_name)
-        for r in promoted_rows
-    }
-
     # Walk manifest in publish order (it's already append-ordered by
     # task_idx, which mirrors publisher commit order). Take the first
-    # ``cap`` unpromoted entries.
+    # ``cap`` entries that aren't yet in the public manifest.
     out: list[_Candidate] = []
     for entry in manifest_entries:
         try:
@@ -351,7 +343,7 @@ async def _list_ready_to_promote(
         except (KeyError, TypeError, ValueError):
             log.warning("promoter.private_manifest.bad_entry", entry=entry)
             continue
-        if key in promoted_keys:
+        if key in already_promoted:
             continue
         committed_at = _parse_iso(entry["committed_at"])
         try:
