@@ -271,101 +271,105 @@ class _Candidate:
 async def _list_ready_to_promote(
     sm, max_per_cycle: int, max_per_day: int,
 ) -> list[_Candidate]:
-    """Pending-promote cells: published + mature window elapsed + not promoted.
+    """Pending-promote cells: present in the private manifest + not yet promoted.
 
-    We can't derive ``task_idx`` / ``reward_*`` from sampling_progress
-    alone; those live in the private manifest. So this query just
-    returns the cell key + PG timestamps, and the caller looks each
-    one up in the private manifest below.
-
-    For simplicity we read the private manifest once and join in
-    memory (cells per cycle is bounded and small).
+    The source of truth for "promotable" is the private manifest, not
+    ``sampling_progress.published_at``. Generator-side hooks (e.g.
+    ``freeze_degenerate_cell``) set ``published_at`` directly to skip
+    publisher processing for zero-variance cells — those cells never
+    enter the manifest but would otherwise pollute the candidate query
+    and saturate any LIMIT the promoter applied. Reading the manifest
+    first and joining DB only for the promoted set sidesteps that whole
+    class of bug.
     """
     cfg = load_config()
     blob = S3BlobStore(cfg.blob)
     prefix = cfg.blob.prefix.rstrip("/")
-    # Read private manifest to recover task_idx + reward stats. May not
-    # exist yet on a cold publisher (first run, no cells published) —
-    # treat that as "nothing to promote" rather than an error.
-    private_uri = f"s3://{cfg.blob.bucket}/{_manifest_key(prefix)}"
     body = await _get_object_or_none(blob, cfg.blob.bucket, _manifest_key(prefix))
-    private_lookup: dict[tuple, dict] = {}
     if body is None:
         return []
+
+    manifest_entries: list[dict] = []
     for line in body.decode("utf-8").splitlines():
         if not line.strip():
             continue
-        obj = json.loads(line)
-        private_lookup[(
-            str(obj["list_name"]), str(obj["env_name"]),
-            int(obj["task_id"]), str(obj["teacher_name"]),
-        )] = obj
-
-    stmt = (
-        select(
-            sp_t.c.list_name, sp_t.c.env_name, sp_t.c.task_id,
-            sp_t.c.teacher_name, sp_t.c.attempts,
-            sp_t.c.published_at,
-        )
-        .where(and_(
-            sp_t.c.published_at.is_not(None),
-            sp_t.c.promoted_at.is_(None),
-        ))
-        .order_by(sp_t.c.published_at)
-        .limit(max_per_cycle * 4)
-    )
+        try:
+            manifest_entries.append(json.loads(line))
+        except json.JSONDecodeError:
+            log.warning("promoter.private_manifest.malformed_line", line=line[:200])
+            continue
+    if not manifest_entries:
+        return []
 
     now = datetime.now(timezone.utc)
     # Rate-based release: count how many cells have been promoted in
     # the last 24h, deduct from the daily cap to get this cycle's
     # remaining budget. ``max_per_day=0`` disables the cap entirely.
+    today_count: int = 0
     if max_per_day > 0:
         async with sm() as session:
-            today_count = await session.scalar(
+            today_count = int(await session.scalar(
                 select(func.count(sp_t.c.task_id)).where(
                     sp_t.c.promoted_at.is_not(None)
                     & (sp_t.c.promoted_at > now - timedelta(hours=24))
                 )
-            )
-        budget = max(0, max_per_day - int(today_count or 0))
+            ) or 0)
+        budget = max(0, max_per_day - today_count)
         cap = min(max_per_cycle, budget)
     else:
         cap = max_per_cycle
     if cap <= 0:
         log.info("promoter.rate_capped", max_per_day=max_per_day,
-                 promoted_last_24h=int(today_count or 0))
+                 promoted_last_24h=today_count)
         return []
 
-    out: list[_Candidate] = []
+    # Read the already-promoted key set from PG so we skip what's done.
+    # One bounded query — the set grows linearly with completed cells,
+    # well under hundreds of thousands at expected throughput.
     async with sm() as session:
-        result = await session.execute(stmt)
-        for row in result:
-            key = (row.list_name, row.env_name, int(row.task_id), row.teacher_name)
-            entry = private_lookup.get(key)
-            if entry is None:
-                log.warning("promoter.private_manifest_missing", key=key)
-                continue
-            committed_at = _parse_iso(entry["committed_at"])
-            # Maturation gate intentionally NOT enforced — release is
-            # rate-controlled via ``max_per_day`` instead. ``mature_at``
-            # is still parsed for the _Candidate record so log/analytics
-            # consumers see the published timeline.
-            try:
-                mature_at = _parse_iso(entry.get("mature_at") or entry["committed_at"])
-            except Exception:
-                mature_at = committed_at
-            out.append(_Candidate(
-                task_idx=int(entry["task_idx"]),
-                list_name=row.list_name, env_name=row.env_name,
-                task_id=int(row.task_id), teacher_name=row.teacher_name,
-                attempts=int(row.attempts),
-                n_rollouts=int(entry["n_rollouts"]),
-                reward_mean=float(entry["reward_mean"]),
-                reward_std=float(entry["reward_std"]),
-                committed_at=committed_at, mature_at=mature_at,
-            ))
-            if len(out) >= cap:
-                break
+        promoted_rows = (await session.execute(
+            select(
+                sp_t.c.list_name, sp_t.c.env_name, sp_t.c.task_id,
+                sp_t.c.teacher_name,
+            ).where(sp_t.c.promoted_at.is_not(None))
+        )).all()
+    promoted_keys = {
+        (r.list_name, r.env_name, int(r.task_id), r.teacher_name)
+        for r in promoted_rows
+    }
+
+    # Walk manifest in publish order (it's already append-ordered by
+    # task_idx, which mirrors publisher commit order). Take the first
+    # ``cap`` unpromoted entries.
+    out: list[_Candidate] = []
+    for entry in manifest_entries:
+        try:
+            key = (
+                str(entry["list_name"]), str(entry["env_name"]),
+                int(entry["task_id"]), str(entry["teacher_name"]),
+            )
+        except (KeyError, TypeError, ValueError):
+            log.warning("promoter.private_manifest.bad_entry", entry=entry)
+            continue
+        if key in promoted_keys:
+            continue
+        committed_at = _parse_iso(entry["committed_at"])
+        try:
+            mature_at = _parse_iso(entry.get("mature_at") or entry["committed_at"])
+        except Exception:
+            mature_at = committed_at
+        out.append(_Candidate(
+            task_idx=int(entry["task_idx"]),
+            list_name=key[0], env_name=key[1],
+            task_id=key[2], teacher_name=key[3],
+            attempts=int(entry.get("attempts", 0)),
+            n_rollouts=int(entry["n_rollouts"]),
+            reward_mean=float(entry["reward_mean"]),
+            reward_std=float(entry["reward_std"]),
+            committed_at=committed_at, mature_at=mature_at,
+        ))
+        if len(out) >= cap:
+            break
     return out
 
 
