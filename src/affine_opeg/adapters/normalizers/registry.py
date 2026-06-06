@@ -10,12 +10,14 @@ from __future__ import annotations
 
 from affine_opeg.adapters.normalizers.affent import AffentNormalizer
 from affine_opeg.adapters.normalizers.claude import ClaudeNormalizer
+from affine_opeg.adapters.normalizers.verifiers import VerifiersNormalizer
 from affine_opeg.domain.errors import NormalizationError
 from affine_opeg.domain.ports.normalizer import TrajectoryNormalizer
 
 _REGISTRY: dict[str, TrajectoryNormalizer] = {
     "affent": AffentNormalizer(),
     "claude": ClaudeNormalizer(),
+    "verifiers": VerifiersNormalizer(),
 }
 
 

@@ -25,8 +25,11 @@ from affine_opeg.adapters.normalizers.registry import get_normalizer
 from affine_opeg.adapters.sandboxes.affent_loop import AffentAgentLoop, AffentLoopConfig
 from affine_opeg.adapters.sandboxes.docker_sandbox import DockerSandboxFactory
 from affine_opeg.application.producer_loop import (
+    BackendRouter,
     ProducerConfig,
     ProducerDeps,
+    RolloutBackend,
+    VERIFIERS_BACKEND,
     run_producer_loop,
 )
 from affine_opeg.domain.ids import EnvName, SamplingListName, TeacherName
@@ -47,6 +50,28 @@ def _csv_env(name: str) -> list[str] | None:
     return [v.strip() for v in value.split(",") if v.strip()]
 
 
+def _build_verifiers_backend(max_concurrency: int):  # -> RolloutBackend
+    """Construct the verifiers backend, importing its adapters lazily.
+
+    The verifiers adapters import the ``verifiers`` package; a SWE-only
+    producer container may not have it installed. Importing here (only when
+    the backend is actually enabled) keeps that container booting.
+    """
+    from affine_opeg.adapters.sandboxes.null_sandbox import NullSandboxFactory
+    from affine_opeg.adapters.sandboxes.verifiers_loop import (
+        VerifiersAgentLoop,
+        VerifiersLoopConfig,
+    )
+
+    return RolloutBackend(
+        name=VERIFIERS_BACKEND,
+        sandbox=NullSandboxFactory(max_concurrent=max_concurrency),
+        agent_loop=VerifiersAgentLoop(VerifiersLoopConfig()),
+        normalizer=get_normalizer("verifiers"),
+        max_concurrency=max_concurrency,
+    )
+
+
 async def main() -> None:
     cfg = load_config()
     configure_logging(cfg, service="producer")
@@ -61,20 +86,47 @@ async def main() -> None:
         raise SystemExit(2)
 
     metadata = SqlAlchemyMetadataStore(sm)
-    sandbox_factory = DockerSandboxFactory(
-        max_concurrent=cfg.rollout.max_concurrent_episodes,
-    )
-    agent_loop = AffentAgentLoop(AffentLoopConfig(
-        max_turns=cfg.rollout.max_steps,
-    ))
-    normalizer = get_normalizer("affent")
+
+    # One producer can host two rollout backends and route each task by env:
+    #   - ``affent`` (default): docker sandbox + affent agent + testbed grade,
+    #     for SWE-style envs (memory-heavy — capped by max_concurrent_episodes).
+    #   - ``verifiers``: container-free PI pathway (NullSandbox + verifiers
+    #     env owns rollout *and* rubric). Cheap on local memory — its own
+    #     (usually higher) cap is ``rollout.verifiers_concurrency``.
+    # ``AFR_ROLLOUT_MODE=verifiers`` forces a verifiers-only producer (no SWE
+    # backend); otherwise SWE is always present and verifiers is added when
+    # ``verifiers_concurrency > 0``. Mixing lets a flood of cheap verifiers
+    # episodes run alongside a memory-safe number of SWE sandboxes.
+    mode = os.environ.get("AFR_ROLLOUT_MODE", "affent").strip().lower()
+    backends: list[RolloutBackend] = []
+    if mode == "verifiers":
+        backends.append(_build_verifiers_backend(cfg.rollout.max_concurrent_episodes))
+        default_backend = VERIFIERS_BACKEND
+    elif mode == "affent":
+        backends.append(RolloutBackend(
+            name="affent",
+            sandbox=DockerSandboxFactory(max_concurrent=cfg.rollout.max_concurrent_episodes),
+            agent_loop=AffentAgentLoop(AffentLoopConfig(max_turns=cfg.rollout.max_steps)),
+            normalizer=get_normalizer("affent"),
+            max_concurrency=cfg.rollout.max_concurrent_episodes,
+        ))
+        default_backend = "affent"
+        if cfg.rollout.verifiers_concurrency > 0:
+            backends.append(_build_verifiers_backend(cfg.rollout.verifiers_concurrency))
+    else:
+        log.error("producer.bad_rollout_mode", mode=mode,
+                  msg="AFR_ROLLOUT_MODE must be 'affent' or 'verifiers'")
+        raise SystemExit(2)
+
+    router = BackendRouter(backends, default=default_backend)
+    log.info("producer.rollout_backends",
+             backends={b.name: b.max_concurrency for b in backends},
+             default=default_backend)
 
     worker_id = f"producer-{os.environ.get('HOSTNAME', 'local')}-{os.getpid()}"
     deps = ProducerDeps(
         metadata=metadata,
-        sandbox=sandbox_factory,
-        normalizer=normalizer,
-        agent_loop=agent_loop,
+        router=router,
         producer_id=worker_id,
     )
 

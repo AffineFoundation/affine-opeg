@@ -78,7 +78,15 @@ class RolloutConfig(BaseModel):
     temperature_min: float = 0.7
     temperature_max: float = 1.2
     max_steps: int = 40
+    # Concurrency cap for the *sandbox* (SWE/affent) backend. Each episode
+    # is a docker sandbox running pip/compile/test, so this is the
+    # memory-bound knob — keep it within the host's RAM budget.
     max_concurrent_episodes: int = 32
+    # Concurrency cap for the container-free verifiers backend. These
+    # episodes only make remote LLM calls (NullSandbox), so they cost ~0
+    # local memory and can run far higher than the sandbox cap. 0 disables
+    # the verifiers backend entirely (sandbox-only producer).
+    verifiers_concurrency: int = 0
     per_teacher_concurrency: int = 16
     blob_archive_async: bool = True
 

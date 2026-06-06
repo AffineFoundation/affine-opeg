@@ -460,7 +460,10 @@ class SaSamplingListRepository:
             {
                 "list_name": p.list_name, "env_name": p.env_name, "task_id": p.task_id,
                 "teacher_name": p.teacher_name, "target_samples": p.target_samples,
-                "collected": p.collected,
+                # ``attempts`` is NOT NULL with no server_default once migration
+                # 0002's backfill default is dropped — set it explicitly (the
+                # model defaults it to 0) so seeding doesn't trip the constraint.
+                "attempts": p.attempts, "collected": p.collected,
             } for p in items
         ]
         stmt = pg_insert(sampling_progress).values(rows)

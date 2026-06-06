@@ -48,6 +48,56 @@ from affine_opeg.infrastructure.metrics import metrics
 
 log = get_logger("producer.loop")
 
+# Backend family name for verifiers (container-free) envs.
+VERIFIERS_BACKEND = "verifiers"
+
+
+@dataclass(frozen=True)
+class RolloutBackend:
+    """A (sandbox, agent_loop, normalizer) triple plus its concurrency cap.
+
+    One producer can host several backends and route each task to the right
+    one by env (see :class:`BackendRouter`). The cap is enforced by a
+    per-backend semaphore so the memory-heavy SWE sandbox backend stays
+    within the host's RAM budget while cheap verifiers (NullSandbox) episodes
+    run at a much higher cap — without either family stealing the other's
+    slots.
+    """
+
+    name: str
+    sandbox: SandboxFactory
+    agent_loop: AgentLoopFn
+    normalizer: TrajectoryNormalizer
+    max_concurrency: int
+
+
+class BackendRouter:
+    """Route a task's env to its rollout backend.
+
+    ``verifiers:*`` envs go to the ``verifiers`` backend (when registered);
+    everything else falls to ``default`` (the SWE/affent sandbox backend).
+    """
+
+    def __init__(self, backends: list[RolloutBackend], default: str) -> None:
+        self._by_name = {b.name: b for b in backends}
+        if default not in self._by_name:
+            raise ValueError(f"default backend {default!r} not in {list(self._by_name)}")
+        self._default = default
+
+    def backend_for(self, env_name: EnvName) -> RolloutBackend:
+        family = str(env_name).split(":", 1)[0]
+        if family == VERIFIERS_BACKEND and VERIFIERS_BACKEND in self._by_name:
+            return self._by_name[VERIFIERS_BACKEND]
+        return self._by_name[self._default]
+
+    @property
+    def backends(self) -> list[RolloutBackend]:
+        return list(self._by_name.values())
+
+    @property
+    def total_concurrency(self) -> int:
+        return sum(b.max_concurrency for b in self._by_name.values())
+
 
 @dataclass(frozen=True)
 class ProducerConfig:
@@ -68,9 +118,7 @@ class ProducerConfig:
 @dataclass
 class ProducerDeps:
     metadata: MetadataStore
-    sandbox: SandboxFactory
-    normalizer: TrajectoryNormalizer
-    agent_loop: AgentLoopFn
+    router: BackendRouter
     producer_id: str = "producer-unknown"
     rng: random.Random = field(default_factory=random.Random)
 
@@ -83,7 +131,14 @@ async def run_producer_loop(
     """Long-running loop. Returns only when ``stop`` is set."""
     if cfg.seed is not None:
         deps.rng.seed(cfg.seed)
-    global_sem = asyncio.Semaphore(cfg.max_concurrent_episodes)
+    # One semaphore per backend, sized to that backend's cap. Created here
+    # (inside the running loop) rather than at wiring time. The overall
+    # in-flight bound is the sum of the per-backend caps — claiming more
+    # than that can't help since every episode must hold a backend slot.
+    backend_sems = {
+        b.name: asyncio.Semaphore(b.max_concurrency) for b in deps.router.backends
+    }
+    total_cap = max(1, deps.router.total_concurrency)
     per_teacher_sems: dict[TeacherName, asyncio.Semaphore] = {}
 
     def _sem_for(t: TeacherName) -> asyncio.Semaphore:
@@ -116,15 +171,19 @@ async def run_producer_loop(
             continue
 
         for cell in cells:
+            backend = deps.router.backend_for(cell.env_name)
             t = asyncio.create_task(
-                _run_cell(deps, cfg, cell, global_sem, _sem_for(cell.teacher_name)),
-                name=f"rollout:{cell.task_id}:{cell.teacher_name}",
+                _run_cell(
+                    deps, cfg, cell, backend,
+                    backend_sems[backend.name], _sem_for(cell.teacher_name),
+                ),
+                name=f"rollout:{backend.name}:{cell.task_id}:{cell.teacher_name}",
             )
             in_flight.add(t)
             t.add_done_callback(in_flight.discard)
 
-        # Apply backpressure: don't claim more than we can run.
-        while len(in_flight) >= cfg.max_concurrent_episodes and not stop.is_set():
+        # Apply backpressure: don't claim more than all backends can run.
+        while len(in_flight) >= total_cap and not stop.is_set():
             done, _ = await asyncio.wait(in_flight, return_when=asyncio.FIRST_COMPLETED)
             for t in done:
                 if t.exception() is not None:
@@ -215,7 +274,8 @@ async def _run_cell(
     deps: ProducerDeps,
     cfg: ProducerConfig,
     cell: SamplingProgress,
-    global_sem: asyncio.Semaphore,
+    backend: RolloutBackend,
+    backend_sem: asyncio.Semaphore,
     teacher_sem: asyncio.Semaphore,
 ) -> None:
     """Produce one rollout for the slot ``claim_next_cell`` handed us.
@@ -241,13 +301,13 @@ async def _run_cell(
         rollout_key=f"{cell.env_name}:{cell.task_id}:{cell.teacher_name}:{sample_idx}",
         list_name=str(cell.list_name),
     ):
-        async with global_sem, teacher_sem:
+        async with backend_sem, teacher_sem:
             try:
                 gen_deps = GenerateRolloutDeps(
                     metadata=deps.metadata,
-                    sandbox=deps.sandbox,
-                    normalizer=deps.normalizer,
-                    agent_loop=deps.agent_loop,
+                    sandbox=backend.sandbox,
+                    normalizer=backend.normalizer,
+                    agent_loop=backend.agent_loop,
                 )
                 rollout = await generate_rollout(gen_deps, params, producer_id=deps.producer_id)
             except Exception as exc:  # noqa: BLE001
