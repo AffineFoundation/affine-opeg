@@ -69,6 +69,11 @@ class RolloutBackend:
     agent_loop: AgentLoopFn
     normalizer: TrajectoryNormalizer
     max_concurrency: int
+    # Claim filter so this backend pulls only its own cells (set only when
+    # multiple backends coexist). ``verifiers:%`` for the verifiers backend;
+    # ``NOT LIKE verifiers:%`` for the default/SWE backend.
+    claim_env_like: str | None = None
+    claim_env_not_like: str | None = None
 
 
 class BackendRouter:
@@ -138,7 +143,6 @@ async def run_producer_loop(
     backend_sems = {
         b.name: asyncio.Semaphore(b.max_concurrency) for b in deps.router.backends
     }
-    total_cap = max(1, deps.router.total_concurrency)
     per_teacher_sems: dict[TeacherName, asyncio.Semaphore] = {}
 
     def _sem_for(t: TeacherName) -> asyncio.Semaphore:
@@ -149,6 +153,29 @@ async def run_producer_loop(
         return sem
 
     in_flight: set[asyncio.Task] = set()
+    # Per-backend in-flight counts so we claim each backend's cells up to its
+    # own cap, independently. Without this, the global ``collected ASC`` claim
+    # order lets a large slow backend (SWE sandboxes) monopolise every batch
+    # and starve the cheap verifiers backend even when it has free capacity.
+    in_flight_by_backend: dict[str, int] = {b.name: 0 for b in deps.router.backends}
+
+    def _dispatch(cell: SamplingProgress, backend: RolloutBackend) -> None:
+        t = asyncio.create_task(
+            _run_cell(deps, cfg, cell, backend,
+                      backend_sems[backend.name], _sem_for(cell.teacher_name)),
+            name=f"rollout:{backend.name}:{cell.task_id}:{cell.teacher_name}",
+        )
+        in_flight.add(t)
+        in_flight_by_backend[backend.name] += 1
+
+        def _done(task: asyncio.Task, _name: str = backend.name) -> None:
+            in_flight.discard(task)
+            in_flight_by_backend[_name] -= 1
+            if task.exception() is not None:
+                log.warning("producer.task_crashed", error=str(task.exception()))
+
+        t.add_done_callback(_done)
+
     log.info("producer.loop.start", list_name=cfg.list_name, **_loop_meta(cfg))
 
     # Run the random-cell scheduler in the background. It tops up the
@@ -162,32 +189,33 @@ async def run_producer_loop(
     )
 
     while not stop.is_set():
-        cells = await _claim_cells(deps.metadata, cfg)
-        if not cells:
-            try:
-                await asyncio.wait_for(stop.wait(), timeout=cfg.poll_idle_sleep_s)
-            except asyncio.TimeoutError:
-                pass
-            continue
-
-        for cell in cells:
-            backend = deps.router.backend_for(cell.env_name)
-            t = asyncio.create_task(
-                _run_cell(
-                    deps, cfg, cell, backend,
-                    backend_sems[backend.name], _sem_for(cell.teacher_name),
-                ),
-                name=f"rollout:{backend.name}:{cell.task_id}:{cell.teacher_name}",
+        claimed = 0
+        any_spare = False
+        # Claim per backend up to its own spare capacity, filtered to that
+        # backend's env family — so neither family starves the other.
+        for backend in deps.router.backends:
+            spare = backend.max_concurrency - in_flight_by_backend[backend.name]
+            if spare <= 0:
+                continue
+            any_spare = True
+            cells = await _claim_cells(
+                deps.metadata, cfg, backend=backend, batch_size=min(spare, cfg.batch_size),
             )
-            in_flight.add(t)
-            t.add_done_callback(in_flight.discard)
+            for cell in cells:
+                _dispatch(cell, backend)
+            claimed += len(cells)
 
-        # Apply backpressure: don't claim more than all backends can run.
-        while len(in_flight) >= total_cap and not stop.is_set():
-            done, _ = await asyncio.wait(in_flight, return_when=asyncio.FIRST_COMPLETED)
-            for t in done:
-                if t.exception() is not None:
-                    log.warning("producer.task_crashed", error=str(t.exception()))
+        if claimed == 0:
+            if not any_spare and in_flight:
+                # Every backend is saturated — wait for a slot to free up.
+                await asyncio.wait(in_flight, return_when=asyncio.FIRST_COMPLETED)
+            else:
+                # Spare capacity but no eligible cells yet (pool still
+                # filling) — idle briefly, honouring the stop signal.
+                try:
+                    await asyncio.wait_for(stop.wait(), timeout=cfg.poll_idle_sleep_s)
+                except asyncio.TimeoutError:
+                    pass
 
     if in_flight:
         log.info("producer.loop.drain", in_flight=len(in_flight))
@@ -258,13 +286,21 @@ async def _maybe_top_up_pool(deps: ProducerDeps, cfg: ProducerConfig) -> None:
         )
 
 
-async def _claim_cells(metadata: MetadataStore, cfg: ProducerConfig) -> list[SamplingProgress]:
+async def _claim_cells(
+    metadata: MetadataStore,
+    cfg: ProducerConfig,
+    *,
+    backend: RolloutBackend | None = None,
+    batch_size: int | None = None,
+) -> list[SamplingProgress]:
     async with metadata.unit_of_work() as uow:
         cells = await uow.sampling_lists.claim_next_cell(
             cfg.list_name,
             env_names=cfg.env_names,
             teacher_names=cfg.teacher_names,
-            batch_size=cfg.batch_size,
+            batch_size=batch_size if batch_size is not None else cfg.batch_size,
+            env_name_like=backend.claim_env_like if backend else None,
+            env_name_not_like=backend.claim_env_not_like if backend else None,
         )
     metrics().incr("producer.cells_claimed", value=len(cells))
     return cells

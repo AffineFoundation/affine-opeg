@@ -152,8 +152,16 @@ class SamplingListRepository(Protocol):
         env_names: Sequence[EnvName] | None = None,
         teacher_names: Sequence[TeacherName] | None = None,
         batch_size: int = 16,
+        max_attempts_per_cell: int | None = None,
+        env_name_like: str | None = None,
+        env_name_not_like: str | None = None,
     ) -> list[SamplingProgress]:
-        """Reserve up to ``batch_size`` open cells under FOR UPDATE SKIP LOCKED."""
+        """Reserve up to ``batch_size`` open cells under FOR UPDATE SKIP LOCKED.
+
+        ``env_name_like`` / ``env_name_not_like`` apply a SQL LIKE / NOT LIKE
+        filter on ``env_name`` so a mixed-backend producer can claim each
+        backend's cells (e.g. ``verifiers:%``) independently.
+        """
 
 
 @runtime_checkable

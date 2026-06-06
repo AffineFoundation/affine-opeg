@@ -50,7 +50,7 @@ def _csv_env(name: str) -> list[str] | None:
     return [v.strip() for v in value.split(",") if v.strip()]
 
 
-def _build_verifiers_backend(max_concurrency: int):  # -> RolloutBackend
+def _build_verifiers_backend(max_concurrency: int, *, claim_env_like: str | None = None):
     """Construct the verifiers backend, importing its adapters lazily.
 
     The verifiers adapters import the ``verifiers`` package; a SWE-only
@@ -69,6 +69,7 @@ def _build_verifiers_backend(max_concurrency: int):  # -> RolloutBackend
         agent_loop=VerifiersAgentLoop(VerifiersLoopConfig()),
         normalizer=get_normalizer("verifiers"),
         max_concurrency=max_concurrency,
+        claim_env_like=claim_env_like,
     )
 
 
@@ -103,16 +104,22 @@ async def main() -> None:
         backends.append(_build_verifiers_backend(cfg.rollout.max_concurrent_episodes))
         default_backend = VERIFIERS_BACKEND
     elif mode == "affent":
+        # Mixed when verifiers is also enabled: each backend claims only its
+        # own family (SWE = NOT verifiers:%, verifiers = verifiers:%) so the
+        # slow sandbox backlog can't starve verifiers in the shared claim order.
+        mixed = cfg.rollout.verifiers_concurrency > 0
         backends.append(RolloutBackend(
             name="affent",
             sandbox=DockerSandboxFactory(max_concurrent=cfg.rollout.max_concurrent_episodes),
             agent_loop=AffentAgentLoop(AffentLoopConfig(max_turns=cfg.rollout.max_steps)),
             normalizer=get_normalizer("affent"),
             max_concurrency=cfg.rollout.max_concurrent_episodes,
+            claim_env_not_like="verifiers:%" if mixed else None,
         ))
         default_backend = "affent"
-        if cfg.rollout.verifiers_concurrency > 0:
-            backends.append(_build_verifiers_backend(cfg.rollout.verifiers_concurrency))
+        if mixed:
+            backends.append(_build_verifiers_backend(
+                cfg.rollout.verifiers_concurrency, claim_env_like="verifiers:%"))
     else:
         log.error("producer.bad_rollout_mode", mode=mode,
                   msg="AFR_ROLLOUT_MODE must be 'affent' or 'verifiers'")

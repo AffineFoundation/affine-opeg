@@ -572,6 +572,8 @@ class SaSamplingListRepository:
         teacher_names: Sequence[TeacherName] | None = None,
         batch_size: int = 16,
         max_attempts_per_cell: int | None = None,
+        env_name_like: str | None = None,
+        env_name_not_like: str | None = None,
     ) -> list[SamplingProgress]:
         """Atomically reserve up to ``batch_size`` open cells.
 
@@ -592,6 +594,7 @@ class SaSamplingListRepository:
         """
         env_filter = ""
         teacher_filter = ""
+        family_filter = ""
         params: dict[str, Any] = {"list_name": list_name, "batch": batch_size}
         if env_names:
             env_filter = "AND env_name = ANY(:envs)"
@@ -599,6 +602,17 @@ class SaSamplingListRepository:
         if teacher_names:
             teacher_filter = "AND teacher_name = ANY(:teachers)"
             params["teachers"] = list(teacher_names)
+        # Family filter (LIKE / NOT LIKE on env_name) — lets a mixed-backend
+        # producer claim each backend's cells independently (e.g. the
+        # verifiers backend pulls only ``verifiers:%`` cells) so a large slow
+        # backend's backlog can't starve the other in the shared collected-ASC
+        # claim order.
+        if env_name_like:
+            family_filter += " AND env_name LIKE :env_like"
+            params["env_like"] = env_name_like
+        if env_name_not_like:
+            family_filter += " AND env_name NOT LIKE :env_not_like"
+            params["env_not_like"] = env_name_not_like
         # Default attempt budget = 2 * target_samples; expressed inline
         # so cells with different targets keep proportional headroom.
         if max_attempts_per_cell is not None:
@@ -615,6 +629,7 @@ class SaSamplingListRepository:
                   {attempt_cap}
                   {env_filter}
                   {teacher_filter}
+                  {family_filter}
                 ORDER BY collected ASC, attempts ASC, task_id ASC
                 LIMIT :batch
                 FOR UPDATE SKIP LOCKED
