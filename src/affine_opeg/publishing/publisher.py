@@ -363,12 +363,24 @@ async def _list_pending_cells(sm, params: PublishParams) -> list[_Cell]:
 
         collected >= target_samples            (already enough successes)
         OR attempts >= 2 * target_samples      (attempt budget spent)
+
+    ``attempts`` increments at *claim* time but ``collected`` only at
+    *completion* time, so for high-concurrency (high sampling-weight) envs a
+    fresh cell's ``attempts`` can race past ``2 * target_samples`` while its
+    rollouts are still in flight. Publishing then reads ~0 rows, marks the
+    cell ``skipped_empty`` + ``published_at``, and the variance-bearing samples
+    that land moments later are lost forever. Gate the attempts branch on a
+    settle window (no ``last_updated`` activity) so we only freeze-by-attempts
+    once the in-flight rollouts have actually resolved.
     """
     conds = [
         sp_t.c.published_at.is_(None),
         or_(
             sp_t.c.collected >= sp_t.c.target_samples,
-            sp_t.c.attempts >= 2 * sp_t.c.target_samples,
+            and_(
+                sp_t.c.attempts >= 2 * sp_t.c.target_samples,
+                sp_t.c.last_updated < func.now() - timedelta(minutes=5),
+            ),
         ),
     ]
     if params.list_names:
