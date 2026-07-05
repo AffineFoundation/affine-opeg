@@ -38,7 +38,7 @@ log = get_logger("verifiers_loop")
 
 @dataclass(frozen=True)
 class VerifiersLoopConfig:
-    max_tokens: int = 2048
+    max_tokens: int = 16384
     # verifiers reads the bearer key from an env var *name* (not the value).
     # We honour the teacher's ``api_key_env`` so creds stay out of payloads.
     client_type: str = "openai_chat_completions"
@@ -70,7 +70,7 @@ class VerifiersAgentLoop:
             api_key_var=teacher.api_key_env,
             client_type=self.cfg.client_type,
         )
-        sampling_args = self._sampling_args(params)
+        sampling_args = self._sampling_args(params, teacher)
         rollout_input = self._rollout_input(task)
 
         state = await env.rollout(rollout_input, client, served_model, sampling_args)
@@ -113,8 +113,17 @@ class VerifiersAgentLoop:
 
     # ---- helpers --------------------------------------------------------- #
 
-    def _sampling_args(self, params: Any) -> dict[str, Any]:
-        args: dict[str, Any] = {"max_tokens": self.cfg.max_tokens}
+    def _sampling_args(self, params: Any, teacher: Teacher | None = None) -> dict[str, Any]:
+        # Clamp max_tokens to the teacher's server-side completion cap when set
+        # (teacher.meta["max_completion_tokens"]). Some chutes serve a lower
+        # ceiling (e.g. MiniMax-M2.5-TEE allows 8192) and 400 on larger requests
+        # -> empty completion -> reward 0.
+        max_tokens = self.cfg.max_tokens
+        if teacher is not None:
+            cap = (teacher.meta or {}).get("max_completion_tokens")
+            if isinstance(cap, int) and cap > 0:
+                max_tokens = min(max_tokens, cap)
+        args: dict[str, Any] = {"max_tokens": max_tokens}
         temp = getattr(params, "temperature", None)
         if temp is not None and temp >= 0:
             args["temperature"] = float(temp)
