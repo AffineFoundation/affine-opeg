@@ -38,6 +38,10 @@ dependencies = [
     # Tokenizers used by normalizers / smoke seed
     "transformers",
     "sentencepiece",
+    # Vendored phybench EED scorer (envs_builtin/phybench_eed.py) needs a
+    # SIGALRM-based timeout; sympy/latex2sympy2-extended come from the
+    # verifiers env stack already present in the image.
+    "timeout-decorator",
 ]
 
 [project.optional-dependencies]
