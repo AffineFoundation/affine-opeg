@@ -30,14 +30,10 @@ from __future__ import annotations
 
 import json
 import os
-import secrets
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import and_, func, select, update
-
-# Non-deterministic CSPRNG for random public release (see _list_ready_to_promote).
-_RNG = secrets.SystemRandom()
 
 from affine_opeg.adapters.blob_stores.s3 import S3BlobStore
 from affine_opeg.adapters.metadata_stores.sqlalchemy_pg.orm import (
@@ -169,11 +165,20 @@ async def promote_mature(params: PromoteParams) -> PromoteResult:
     # when no new promotions occurred.
     completed_up_to = len(public_manifest_lines) + len(appended_lines)
     staged_up_to = await _private_manifest_count(blob, prefix, private_bucket)
+    # ``staged_released`` is the validator's grading front: the public front
+    # plus one release-window of look-ahead, capped at the private depth. The
+    # validator reads tasks in [0, staged_released) from the private bucket, so
+    # it grades a cell ~one maturation window before it is mirrored to public
+    # and miners can pull it. Kept a contiguous prefix (FIFO release) so the
+    # consumer's zero_to_value range sampling never hits a missing task_idx.
+    lookahead = params.max_per_day if params.max_per_day > 0 else 100
+    staged_released = min(completed_up_to + lookahead, staged_up_to)
     metadata_body = json.dumps({
         "version": 1,
         "last_updated": datetime.now(timezone.utc).isoformat(),
         "tasks": {
             "staged_up_to": staged_up_to,
+            "staged_released": staged_released,
             "completed_up_to": completed_up_to,
         },
     }, sort_keys=True).encode("utf-8")
@@ -370,12 +375,11 @@ async def _list_ready_to_promote(
             reward_std=float(entry["reward_std"]),
             committed_at=committed_at, mature_at=mature_at,
         ))
-    # Random public release: sample ``cap`` from the whole matured+unpromoted
-    # pool instead of taking the first ``cap`` in task_idx (commit) order, so
-    # the public bucket isn't a strict FIFO drip of the oldest shards.
-    if len(out) > cap:
-        out = _RNG.sample(out, cap)
-    return out
+    # Contiguous FIFO release (oldest task_idx first). The consumer samples a
+    # zero_to_value range [0, N] and errors on any task_idx missing from the
+    # manifest, so the released set must stay a contiguous prefix — a random
+    # subset would leave holes in the range. Take the first ``cap`` in order.
+    return out[:cap]
 
 
 def _parse_iso(s: str) -> datetime:
