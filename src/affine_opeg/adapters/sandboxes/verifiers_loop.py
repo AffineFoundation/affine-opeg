@@ -23,8 +23,24 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
+
+
+def _default_max_tokens() -> int:
+    """Completion budget for a verifiers rollout.
+
+    Env-tunable (no rebuild) via ``AFR_VERIFIERS_MAX_TOKENS``. Heavy-reasoning
+    teachers (Kimi/Qwen-Thinking) burn the whole budget on ``<think>`` on hard
+    envs like phybench and get cut off (``finish_reason=length``) before
+    emitting the boxed answer -> empty completion. A larger budget lets them
+    finish reasoning + answer, at the cost of slower/pricier rollouts. Still
+    clamped down per-teacher by ``teacher.meta['max_completion_tokens']``.
+    """
+    try:
+        return int(os.environ.get("AFR_VERIFIERS_MAX_TOKENS", "49152"))
+    except ValueError:
+        return 49152
 
 import verifiers as vf
 
@@ -38,7 +54,7 @@ log = get_logger("verifiers_loop")
 
 @dataclass(frozen=True)
 class VerifiersLoopConfig:
-    max_tokens: int = 16384
+    max_tokens: int = field(default_factory=_default_max_tokens)
     # verifiers reads the bearer key from an env var *name* (not the value).
     # We honour the teacher's ``api_key_env`` so creds stay out of payloads.
     client_type: str = "openai_chat_completions"
