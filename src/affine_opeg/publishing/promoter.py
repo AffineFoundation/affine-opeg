@@ -30,10 +30,14 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import and_, func, select, update
+
+# Non-deterministic CSPRNG for random public release (see _list_ready_to_promote).
+_RNG = secrets.SystemRandom()
 
 from affine_opeg.adapters.blob_stores.s3 import S3BlobStore
 from affine_opeg.adapters.metadata_stores.sqlalchemy_pg.orm import (
@@ -350,6 +354,12 @@ async def _list_ready_to_promote(
             mature_at = _parse_iso(entry.get("mature_at") or entry["committed_at"])
         except Exception:
             mature_at = committed_at
+        # Maturation gate: a shard is staged in the private bucket (validator
+        # reads it there) until ``mature_at`` (= committed_at + maturation
+        # window). Hold it back from the public mirror until then, so miners
+        # can't pull it before the validator has graded against it.
+        if mature_at > now:
+            continue
         out.append(_Candidate(
             task_idx=int(entry["task_idx"]),
             list_name=key[0], env_name=key[1],
@@ -360,8 +370,11 @@ async def _list_ready_to_promote(
             reward_std=float(entry["reward_std"]),
             committed_at=committed_at, mature_at=mature_at,
         ))
-        if len(out) >= cap:
-            break
+    # Random public release: sample ``cap`` from the whole matured+unpromoted
+    # pool instead of taking the first ``cap`` in task_idx (commit) order, so
+    # the public bucket isn't a strict FIFO drip of the oldest shards.
+    if len(out) > cap:
+        out = _RNG.sample(out, cap)
     return out
 
 
