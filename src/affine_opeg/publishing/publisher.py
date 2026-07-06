@@ -524,12 +524,30 @@ async def publisher_loop(*, interval_s: float = 300.0) -> None:
     its maturation window gets server-side copied (R2 CopyObject) to
     the **public** bucket, and its public manifest line is appended.
     """
+    import time
+
+    from affine_opeg.infrastructure.config import load_config
+    from affine_opeg.infrastructure.db import get_sessionmaker
     from affine_opeg.publishing.promoter import (
         params_from_env as promote_params_from_env,
         promote_mature,
     )
+    from affine_opeg.publishing.reweighter import (
+        params_from_env as reweight_params_from_env,
+        pins_from_env,
+        reweight_pool,
+    )
 
-    log.info("publisher.loop.start", interval_s=interval_s)
+    # Stage 3 (reweight) is a docker-native replacement for the host cron:
+    # the publisher self-reweights the pool on its own throttle. First run
+    # fires one interval after start (weights were applied at deploy time).
+    rw = reweight_params_from_env()
+    rw_sm = get_sessionmaker(load_config()) if rw["enabled"] else None
+    rw_pins = pins_from_env()
+    last_reweight = time.monotonic()
+
+    log.info("publisher.loop.start", interval_s=interval_s,
+             reweight_enabled=rw["enabled"], reweight_interval_s=rw["interval_s"])
     while True:
         try:
             pub = await publish_rollouts(_params_from_env())
@@ -553,6 +571,24 @@ async def publisher_loop(*, interval_s: float = 300.0) -> None:
             )
         except Exception as exc:  # noqa: BLE001
             log.error("publisher.promote_failed", error=str(exc)[:400])
+
+        if rw_sm is not None and time.monotonic() - last_reweight >= rw["interval_s"]:
+            try:
+                weights, labels = await reweight_pool(
+                    rw_sm, rw["list_name"],
+                    window_hours=rw["window_hours"], cut_yield=rw["cut_yield"],
+                    alpha=rw["alpha"], min_cells=rw["min_cells"], floor=rw["floor"],
+                    pins=rw_pins, apply=True,
+                )
+                cut = [e for e, l in labels.items() if l.startswith("CUT")]
+                log.info(
+                    "publisher.cycle.reweight_done",
+                    list_name=rw["list_name"], n_envs=len(weights),
+                    cut=cut, window_h=rw["window_hours"],
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.error("publisher.reweight_failed", error=str(exc)[:400])
+            last_reweight = time.monotonic()
 
         await asyncio.sleep(interval_s)
 

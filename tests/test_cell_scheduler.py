@@ -53,9 +53,7 @@ def test_ttl_override():
 
 
 # --- reweight controller pure logic ---
-import sys, os as _os  # noqa: E402
-sys.path.insert(0, _os.path.join(_os.path.dirname(__file__), "..", "scripts"))
-from reweight_pool import compute_weights  # noqa: E402
+from affine_opeg.publishing.reweighter import compute_weights  # noqa: E402
 
 
 def test_reweight_cut_warmup_aggressive():
@@ -83,6 +81,21 @@ def test_reweight_no_data_uniform():
     w, lab = compute_weights(envs, stats, cut_yield=0.10, alpha=2.0, min_cells=30, floor=0.03)
     assert w["a"] == w["b"] and all(v > 0 for v in w.values())
     assert all(l.startswith("warmup") for l in lab.values())
+
+
+def test_reweight_pin_floor():
+    # swe has low yield -> would be CUT to the floor, but a pin raises it.
+    envs = ["hot", "swe-rebench"]
+    stats = {"hot": (0.50, 200), "swe-rebench": (0.06, 200)}
+    w, lab = compute_weights(
+        envs, stats, cut_yield=0.10, alpha=2.0, min_cells=30, floor=0.03,
+        pins={"swe-rebench": 0.10},
+    )
+    assert w["swe-rebench"] == 0.10  # pinned above its floor(0.03)
+    assert "pinned" in lab["swe-rebench"] and "CUT" in lab["swe-rebench"]
+    # pin gives swe a real share (~10/(10+28)) rather than the ~3% floor
+    total = sum(w.values())
+    assert 0.20 < w["swe-rebench"] / total < 0.30
 
 
 if __name__ == "__main__":
