@@ -113,7 +113,7 @@ def _build_gsm8k(n: int = 200, split: str = "test") -> Any:
 register_builtin("gsm8k", _build_gsm8k)
 
 
-def _build_phybench(use_think: bool = True) -> Any:
+def _build_phybench(use_think: bool = False) -> Any:
     """PHYBench physics-reasoning env with a continuous EED reward.
 
     The PI hub ``phybench`` wheel is broken — it ships only ``phybench.py``,
@@ -126,6 +126,13 @@ def _build_phybench(use_think: bool = True) -> Any:
 
     Registered as a builtin so ``load_verifiers_env('phybench')`` falls back
     here after the hub load raises.
+
+    ``use_think=False`` on purpose: the plain boxed ``Parser`` extracts the
+    ``\\boxed{}`` answer whether or not the model emits ``<think>`` tags, so it
+    is robust across our mixed teacher fleet. ``ThinkParser`` returns nothing
+    (reward 0) for teachers whose chat template strips think tags (Qwen3,
+    DeepSeek-R1 style) — verified: plain boxed completion scores 0 under
+    ThinkParser but 1.0 under Parser.
     """
     from datasets import load_dataset
     from verifiers.envs.singleturn_env import SingleTurnEnv
