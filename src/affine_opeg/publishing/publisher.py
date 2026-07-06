@@ -99,6 +99,13 @@ class PublishParams:
     # 0 means no maturation delay; promoter controls release via
     # ``AFR_PROMOTE_MAX_PER_DAY`` rate cap instead.
     maturation_window_s: int = 0
+    # Zombie TTL: a still-eligible cell (collected < target, attempts <
+    # 2*target) whose ``last_updated`` is older than this is force-settled
+    # here — published if its samples carry variance, else skipped. Without
+    # it, un-completable cells (broken swe tasks, always-erroring teachers)
+    # linger forever occupying an active slot. Matches
+    # ``cell_scheduler.DEFAULT_CELL_TTL_S`` (6h).
+    cell_ttl_s: int = 21600
 
 
 @dataclass(frozen=True)
@@ -181,6 +188,9 @@ async def publish_rollouts(params: PublishParams) -> PublishResult:
     # 2) Pending = frozen + not yet marked published.
     cells = await _list_pending_cells(sm, params)
     log.info("publisher.cells.pending", n=len(cells))
+    n_zombie = sum(1 for c in cells if c.zombie)
+    if n_zombie:
+        log.info("publisher.cells.zombie_settling", n=n_zombie)
 
     new_lines: list[str] = []
     cells_to_mark: list[CellKey] = []
@@ -353,6 +363,7 @@ class _Cell:
     target_samples: int
     attempts: int
     collected: int
+    zombie: bool = False  # frozen by TTL (stale) rather than by target/budget
 
 
 async def _list_pending_cells(sm, params: PublishParams) -> list[_Cell]:
@@ -363,6 +374,7 @@ async def _list_pending_cells(sm, params: PublishParams) -> list[_Cell]:
 
         collected >= target_samples            (already enough successes)
         OR attempts >= 2 * target_samples      (attempt budget spent)
+        OR last_updated < now() - cell_ttl_s   (zombie: stale, un-completable)
 
     ``attempts`` increments at *claim* time but ``collected`` only at
     *completion* time, so for high-concurrency (high sampling-weight) envs a
@@ -372,7 +384,20 @@ async def _list_pending_cells(sm, params: PublishParams) -> list[_Cell]:
     that land moments later are lost forever. Gate the attempts branch on a
     settle window (no ``last_updated`` activity) so we only freeze-by-attempts
     once the in-flight rollouts have actually resolved.
+
+    The third (zombie) branch settles cells that never reached ``target``
+    and never spent their attempt budget but have sat untouched past
+    ``cell_ttl_s`` — un-completable tasks the claim order deprioritised
+    forever. They get published if their samples carry variance, else
+    skipped; either way they stop occupying an active slot. ``cell_ttl_s``
+    (default 6h) is far above normal cell completion time (minutes), so a
+    genuinely in-flight cell is never mistaken for a zombie.
     """
+    zombie_cond = and_(
+        sp_t.c.collected < sp_t.c.target_samples,
+        sp_t.c.attempts < 2 * sp_t.c.target_samples,
+        sp_t.c.last_updated < func.now() - timedelta(seconds=params.cell_ttl_s),
+    )
     conds = [
         sp_t.c.published_at.is_(None),
         or_(
@@ -381,6 +406,7 @@ async def _list_pending_cells(sm, params: PublishParams) -> list[_Cell]:
                 sp_t.c.attempts >= 2 * sp_t.c.target_samples,
                 sp_t.c.last_updated < func.now() - timedelta(minutes=5),
             ),
+            zombie_cond,
         ),
     ]
     if params.list_names:
@@ -405,12 +431,19 @@ async def _list_pending_cells(sm, params: PublishParams) -> list[_Cell]:
     async with sm() as session:
         result = await session.execute(stmt)
         for row in result:
+            # zombie = selected only via the TTL branch: still eligible
+            # (below target and within attempt budget) but stale.
+            is_zombie = (
+                int(row.collected) < int(row.target_samples)
+                and int(row.attempts) < 2 * int(row.target_samples)
+            )
             out.append(_Cell(
                 list_name=row.list_name, env_name=row.env_name,
                 task_id=int(row.task_id), teacher_name=row.teacher_name,
                 target_samples=int(row.target_samples),
                 attempts=int(row.attempts),
                 collected=int(row.collected),
+                zombie=is_zombie,
             ))
     return out
 
@@ -542,6 +575,7 @@ def _params_from_env() -> PublishParams:
         min_reward_std=_float("AFR_PUBLISH_MIN_REWARD_STD", default=0.05),
         max_new_per_cycle=_int("AFR_PUBLISH_MAX_NEW_PER_CYCLE", default=200),
         maturation_window_s=_int("AFR_PUBLISH_MATURATION_S", default=0),
+        cell_ttl_s=_int("AFR_PUBLISH_CELL_TTL_S", default=21600),
     )
 
 
