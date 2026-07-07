@@ -3,19 +3,13 @@
 Why
 ---
 
-The old design (admin pre-INSERTs every cell into ``sampling_progress``)
-makes the upcoming ``(env, task_id, teacher)`` triples *predictable*. A
-miner that watches the published manifest can extrapolate the admin's
-selection policy and pre-cache answers / pre-train on the next batch
-before it's evaluated.
-
-This module flips it: the admin only configures a **pool** (a set of
-allowed envs / task_id ranges / teachers) inside
-``sampling_lists.config.pool``. Cells are materialised by
+Rather than pre-INSERTing every ``(env, task_id, teacher)`` cell up front
+(which makes the upcoming triples predictable), the admin only configures a
+**pool** (allowed envs / task_id ranges / teachers) inside
+``sampling_lists.config.pool``. Cells are materialised on demand by
 :func:`maintain_active_pool` picking a random ``(task_id, teacher)`` with
-:class:`secrets.SystemRandom`. The random pick is unpredictable in
-advance — only the validator's producer process knows which cell it just
-chose, and only *after* ``sampling_progress`` got the new row.
+:class:`secrets.SystemRandom`, so the next cell is not determined until the
+producer process has written its ``sampling_progress`` row.
 
 Per-env weighting
 -----------------

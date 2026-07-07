@@ -162,17 +162,13 @@ async def promote_mature(params: PromoteParams) -> PromoteResult:
     # Rewritten every cycle so ``last_updated`` stays meaningful even
     # when no new promotions occurred.
     completed_up_to = len(public_manifest_lines) + len(appended_lines)
-    # ``staged_up_to`` (the full private depth) is computed only to cap
-    # ``staged_released`` below — it is deliberately NOT published, so the
-    # public metadata does not advertise how far ahead the private/eval set
-    # is staged.
+    # ``staged_up_to`` (the full private manifest depth) is used only to cap
+    # ``staged_released`` below; it is not written to the metadata.
     staged_up_to = await _private_manifest_count(blob, prefix, private_bucket)
     # ``staged_released`` is the validator's grading front: the public front
-    # plus one release-window of look-ahead, capped at the private depth. The
-    # validator reads tasks in [0, staged_released) from the private bucket, so
-    # it grades a cell ~one maturation window before it is mirrored to public
-    # and miners can pull it. Kept a contiguous prefix (FIFO release) so the
-    # consumer's zero_to_value range sampling never hits a missing task_idx.
+    # plus one release-window of look-ahead, capped at ``staged_up_to``. Kept
+    # a contiguous prefix (FIFO) so the consumer's zero_to_value range
+    # sampling never hits a missing task_idx.
     lookahead = params.max_per_day if params.max_per_day > 0 else 100
     staged_released = min(completed_up_to + lookahead, staged_up_to)
     metadata_body = json.dumps({
@@ -218,7 +214,7 @@ async def promote_mature(params: PromoteParams) -> PromoteResult:
 
 async def _private_manifest_count(blob, prefix: str, private_bucket: str) -> int:
     """Cheap count of entries in the private manifest, used as the
-    ``staged_up_to`` value advertised through the public metadata.json.
+    ``staged_up_to`` cap for ``staged_released``.
     Returns 0 when the manifest does not exist yet (cold start)."""
     body = await _get_object_or_none(blob, private_bucket, _manifest_key(prefix))
     if not body:
@@ -360,10 +356,9 @@ async def _list_ready_to_promote(
             mature_at = _parse_iso(entry.get("mature_at") or entry["committed_at"])
         except Exception:
             mature_at = committed_at
-        # Maturation gate: a shard is staged in the private bucket (validator
-        # reads it there) until ``mature_at`` (= committed_at + maturation
-        # window). Hold it back from the public mirror until then, so miners
-        # can't pull it before the validator has graded against it.
+        # Maturation gate: a shard stays in the private bucket until
+        # ``mature_at`` (= committed_at + maturation window) before it is
+        # mirrored to the public bucket.
         if mature_at > now:
             continue
         out.append(_Candidate(
