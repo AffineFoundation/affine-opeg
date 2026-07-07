@@ -605,8 +605,7 @@ class SaSamplingListRepository:
         # Family filter (LIKE / NOT LIKE on env_name) — lets a mixed-backend
         # producer claim each backend's cells independently (e.g. the
         # verifiers backend pulls only ``verifiers:%`` cells) so a large slow
-        # backend's backlog can't starve the other in the shared collected-ASC
-        # claim order.
+        # backend's backlog can't starve the other in the shared claim order.
         if env_name_like:
             family_filter += " AND env_name LIKE :env_like"
             params["env_like"] = env_name_like
@@ -630,7 +629,14 @@ class SaSamplingListRepository:
                   {env_filter}
                   {teacher_filter}
                   {family_filter}
-                ORDER BY collected ASC, attempts ASC, task_id ASC
+                -- Depth-first: finish the cells closest to target first
+                -- (``collected DESC``). Breadth-first (``collected ASC``)
+                -- deadlocks throughput — the scheduler keeps topping the pool
+                -- up with fresh ``collected=0`` cells that always outrank the
+                -- near-complete ones, so cells pile up at target-1 and never
+                -- freeze/commit. Finishing high-collected cells first makes
+                -- them cross target, freeze, and publish steadily.
+                ORDER BY collected DESC, attempts ASC, task_id ASC
                 LIMIT :batch
                 FOR UPDATE SKIP LOCKED
             )
