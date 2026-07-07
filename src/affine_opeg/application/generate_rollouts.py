@@ -101,6 +101,16 @@ async def generate_rollout(
         if normalize_err is not None:
             status = RolloutStatus.parse_failed
 
+        # Zero comparable tokens -> mark non-ok so the sample is excluded from
+        # ``collected`` and from the published cell (see RolloutStatus docs).
+        if status == RolloutStatus.ok and not _has_comparable_content(normalized):
+            status = RolloutStatus.empty_completion
+            log.warning(
+                "rollout.empty_completion",
+                env_name=str(params.env_name), task_id=int(params.task_id),
+                teacher_name=str(params.teacher_name),
+            )
+
         # We always have *some* payload to persist — fall back to a stub
         # describing the failure so the row is still parseable.
         if normalized is None:
@@ -242,6 +252,25 @@ def _normalize(
     except NormalizationError as e:
         log.warning("rollout.normalize_failed", error=str(e))
         return None, str(e)
+
+
+def _has_comparable_content(normalized) -> bool:  # type: ignore[no-untyped-def]
+    """True if any assistant message carries a loss-bearing token span.
+
+    Mirrors the eval renderer's loss mask (``assistant_loss`` = non-empty
+    ``content`` + ``tool_calls``; ``reasoning`` is masked). A trajectory with
+    no such span renders to an all-zero loss mask -> nothing to compare.
+    """
+    if normalized is None:
+        return False
+    for msg in normalized.messages:
+        if getattr(msg, "role", None) != "assistant":
+            continue
+        if (msg.content or "").strip():
+            return True
+        if getattr(msg, "tool_calls", None):
+            return True
+    return False
 
 
 def _reward(breakdown: dict) -> float | None:

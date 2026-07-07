@@ -125,6 +125,13 @@ class RolloutStatus(str, Enum):
     truncated = "truncated"
     env_error = "env_error"
     teacher_error = "teacher_error"
+    # No comparable tokens: the assistant produced no non-empty ``content``
+    # and no ``tool_calls`` (e.g. a reasoning model that spent its whole
+    # budget on ``<think>`` and never emitted an answer). With reasoning
+    # masked at eval time these rollouts render to a zero loss-mask, which
+    # pollutes the student/teacher CE-KL comparison — so they are marked
+    # non-ok here: excluded from ``collected`` and from the published cell.
+    empty_completion = "empty_completion"
 
 
 class GroupLabel(str, Enum):
