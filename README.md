@@ -9,7 +9,7 @@ Python import name: `affine_opeg`.
 ## What it does
 
 1. **Generator** schedules `(env_name, task_id, teacher_model)` cells from a
-   sampling pool (CSPRNG-backed so miners can't predict the next task).
+   sampling pool (cells materialised on demand via CSPRNG).
 2. For each cell it runs N agentic rollouts inside per-task Docker sandboxes
    (swe-rebench style), driven by [`affent`](https://github.com/AffineFoundation/affent).
 3. Each rollout's trajectory + reward goes to Postgres; the same row holds a
