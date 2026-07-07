@@ -158,12 +158,14 @@ async def promote_mature(params: PromoteParams) -> PromoteResult:
         )
 
     # 4b) Refresh the thin public metadata.json. ``completed_up_to`` is
-    # the count of mature cells (= entries in the public manifest);
-    # ``staged_up_to`` is what publisher has put into the private
-    # bucket so consumers can see the in-flight pipeline depth.
+    # the count of mature cells (= entries in the public manifest).
     # Rewritten every cycle so ``last_updated`` stays meaningful even
     # when no new promotions occurred.
     completed_up_to = len(public_manifest_lines) + len(appended_lines)
+    # ``staged_up_to`` (the full private depth) is computed only to cap
+    # ``staged_released`` below — it is deliberately NOT published, so the
+    # public metadata does not advertise how far ahead the private/eval set
+    # is staged.
     staged_up_to = await _private_manifest_count(blob, prefix, private_bucket)
     # ``staged_released`` is the validator's grading front: the public front
     # plus one release-window of look-ahead, capped at the private depth. The
@@ -177,7 +179,6 @@ async def promote_mature(params: PromoteParams) -> PromoteResult:
         "version": 1,
         "last_updated": datetime.now(timezone.utc).isoformat(),
         "tasks": {
-            "staged_up_to": staged_up_to,
             "staged_released": staged_released,
             "completed_up_to": completed_up_to,
         },
