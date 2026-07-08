@@ -7,9 +7,17 @@ construction happens in the SqlAlchemyUnitOfWork.
 
 from __future__ import annotations
 
+import os
 from collections.abc import AsyncIterator, Sequence
 from datetime import datetime
 from typing import Any
+
+
+def _int_env(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, "").strip() or default)
+    except ValueError:
+        return default
 
 from sqlalchemy import and_, delete, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -619,6 +627,16 @@ class SaSamplingListRepository:
             params["max_attempts"] = max_attempts_per_cell
         else:
             attempt_cap = "AND attempts < (2 * target_samples)"
+        # In-flight throttle: cap how many attempts a cell can have beyond its
+        # collected count. ``attempts`` bumps at claim time but ``collected``
+        # only at success time, so under high concurrency dozens of producers
+        # see the same near-complete cell as claimable and all pile on before
+        # collected catches up — the cell overshoots to ~2*target and half the
+        # samples are wasted. Bounding ``attempts - collected`` to a small slack
+        # spreads concurrency across many cells instead of a thundering herd on
+        # a few, so each cell takes ~target samples (not 2*target).
+        params["inflight_slack"] = _int_env("AFR_CLAIM_INFLIGHT_SLACK", 4)
+        inflight_cap = "AND (attempts - collected) < :inflight_slack"
         sql = f"""
             WITH cte AS (
                 SELECT list_name, env_name, task_id, teacher_name
@@ -627,6 +645,7 @@ class SaSamplingListRepository:
                   AND published_at IS NULL
                   AND collected < target_samples
                   {attempt_cap}
+                  {inflight_cap}
                   {env_filter}
                   {teacher_filter}
                   {family_filter}
