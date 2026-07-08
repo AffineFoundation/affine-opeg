@@ -624,6 +624,7 @@ class SaSamplingListRepository:
                 SELECT list_name, env_name, task_id, teacher_name
                 FROM sampling_progress
                 WHERE list_name = :list_name
+                  AND published_at IS NULL
                   AND collected < target_samples
                   {attempt_cap}
                   {env_filter}
