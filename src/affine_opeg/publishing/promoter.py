@@ -60,6 +60,11 @@ class PromoteParams:
     # Set to 0 to disable the cap (release as fast as the publisher
     # feeds the backlog).
     max_per_day: int = 100
+    # How many release-windows ahead the validator's grading front
+    # (``staged_released``) runs past the public front. At ``max_per_day``
+    # release/day, ``stage_days`` windows of look-ahead means a task is
+    # graded ``stage_days`` days before it is mirrored to the public bucket.
+    stage_days: int = 1
 
 
 @dataclass(frozen=True)
@@ -169,7 +174,8 @@ async def promote_mature(params: PromoteParams) -> PromoteResult:
     # plus one release-window of look-ahead, capped at ``staged_up_to``. Kept
     # a contiguous prefix (FIFO) so the consumer's zero_to_value range
     # sampling never hits a missing task_idx.
-    lookahead = params.max_per_day if params.max_per_day > 0 else 100
+    per_window = params.max_per_day if params.max_per_day > 0 else 100
+    lookahead = max(1, params.stage_days) * per_window
     staged_released = min(completed_up_to + lookahead, staged_up_to)
     metadata_body = json.dumps({
         "version": 1,
@@ -432,4 +438,9 @@ def params_from_env() -> PromoteParams:
         max_per_day = int(raw_day) if raw_day else 100
     except ValueError:
         max_per_day = 100
-    return PromoteParams(max_per_cycle=max_per_cycle, max_per_day=max_per_day)
+    raw_sd = os.environ.get("AFR_STAGE_DAYS", "").strip()
+    try:
+        stage_days = int(raw_sd) if raw_sd else 1
+    except ValueError:
+        stage_days = 1
+    return PromoteParams(max_per_cycle=max_per_cycle, max_per_day=max_per_day, stage_days=stage_days)
