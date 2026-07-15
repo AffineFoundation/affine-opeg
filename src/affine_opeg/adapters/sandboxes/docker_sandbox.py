@@ -118,13 +118,41 @@ class DockerSandbox:
         return proc.returncode or 0, stdout, stderr
 
     async def exec(self, script: str, *, timeout: int = 60) -> tuple[int, str, str]:
-        """SandboxExec.exec — run ``bash -c script`` inside the container."""
+        """SandboxExec.exec — run ``bash -c script`` inside the container.
+
+        Returns the *script's* rc/stdout/stderr. When the container itself is
+        gone (OOM-killed, evicted, reaped) there is no script result to
+        report: returning the docker CLI's failure as if the script produced
+        it lets infra deaths masquerade as task failures — the pytest grader
+        would parse "Error response from daemon: container ... is not
+        running" as a 0/0 run and record reward=0. Raise SandboxError
+        instead so the rollout is persisted as non-ok and never published.
+        """
         if self.container_id is None:
             raise SandboxError("container not started")
         rc, out, err = await self._docker(
             "exec", self.container_id, "bash", "-c", script, timeout=timeout,
         )
+        if rc != 0 and not await self._is_running():
+            raise SandboxError(
+                f"container died mid-run (exec rc={rc}): "
+                f"{err.decode(errors='replace')[:300]}"
+            )
         return rc, out.decode(errors="replace"), err.decode(errors="replace")
+
+    async def _is_running(self) -> bool:
+        """Liveness probe via ``docker inspect``; False on any failure so a
+        removed container (inspect: "No such object") also reads as dead."""
+        if self.container_id is None:
+            return False
+        try:
+            rc, out, _err = await self._docker(
+                "inspect", "-f", "{{.State.Running}}", self.container_id,
+                timeout=10,
+            )
+        except SandboxTimeout:
+            return False
+        return rc == 0 and out.decode(errors="replace").strip() == "true"
 
     async def _pull(self) -> None:
         # Fast path: image already fully present locally → skip the
